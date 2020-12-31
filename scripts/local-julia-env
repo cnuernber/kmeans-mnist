@@ -1,0 +1,10 @@
+#!/bin/bash
+
+if [ ! -e julia-1.5.3 ]; then
+    wget https://julialang-s3.julialang.org/bin/linux/x64/1.5/julia-1.5.3-linux-x86_64.tar.gz \
+	&& tar -xvzf julia-1.5.3-linux-x86_64.tar.gz
+fi
+
+export JULIA_HOME=$(pwd)/julia-1.5.3
+export PATH=$JULIA_HOME/bin:$PATH
+export LD_PRELOAD=/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64/server/libjsig.so
