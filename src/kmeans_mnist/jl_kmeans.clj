@@ -1,17 +1,19 @@
 (ns kmeans-mnist.jl-kmeans
   (:require [libjulia-clj.julia :refer [jl] :as julia]
-            [tvm-clj.ast :as ast]
-            [tvm-clj.ast.elemwise-op :as ast-op]
-            [tvm-clj.schedule :as schedule]
-            [tvm-clj.compiler :as compiler]
             [tech.v3.datatype :as dtype]
             [tech.v3.datatype.argops :as argops]
             [tech.v3.datatype.errors :as errors]
+            [tech.v3.datatype.functional :as dfn]
             [tech.v3.tensor :as dtt]
             [tech.v3.parallel.for :as pfor]
+            [tech.v3.datatype.reductions :as reductions]
             [tech.v3.libs.buffered-image :as bufimg]
             [clojure.java.io :as io])
-  (:import [java.util Random]))
+  (:import [java.util Random HashMap]
+           [java.util.function BiFunction BiConsumer]
+           [tech.v3.datatype ArrayHelpers IndexReduction
+            IndexReduction$IndexedBiFunction]))
+
 
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
@@ -24,6 +26,7 @@
   (def loader (jl (slurp (io/resource "kmeans.jl"))))
   (def kmeans-next-centroid (jl "kmeans_next_centroid"))
   (def assign-centroids (jl "assign_centroids"))
+  (def assign-centroids-imr (jl "assign_centroids_imr"))
   (def score-kmeans (jl "score_kmeans")))
 
 
@@ -75,104 +78,6 @@
         (recur (unchecked-inc idx))))))
 
 
-(defn- tvm-dist-sum-algo
-  "Update the distances with values from the new centroid and produce a cumulative
-  summation vector we can binary search through.  This uses a special form where we
-  just add in the new centroid to our existing distance vector and recalculate our
-  cumulative summation vector.  This is similar to the distance methods below except
-  we only calculate one centroid at a time."
-  [n-cols dataset-datatype]
-  (let [n-centroids (ast/variable "n_centroids")
-        n-rows (ast/variable "nrows")
-        n-cols (ast-op/const n-cols :int32)
-        center-idx (ast/variable "center-idx")
-        ;;The distance calculation is the only real issue here.
-        ;;Everything else, sort, etc. is pretty quick and sorting
-        centroids (ast/placeholder [n-centroids n-cols] "centroids" :dtype :float64)
-        dataset (ast/placeholder [n-rows n-cols] "dataset" :dtype dataset-datatype)
-        ;;distances are doubles so summation is in double space
-        distances (ast/placeholder [n-rows] "distances" :dtype :float64)
-        ;;Single centroid squared distance calculation
-        squared-diff (-> (ast/compute
-                          [n-rows n-cols] "squared-diff" nil
-                          [row-idx col-idx]
-                          (ast/tvm-let
-                           [row-elem (-> (ast/tget dataset [row-idx col-idx])
-                                         (ast-op/cast :float64))
-                            center-elem (ast/tget centroids [center-idx col-idx])
-                            diff (ast-op/- row-elem center-elem)]
-                           (ast-op/* diff diff)))
-                         (ast/first-output))
-        squared-dist (-> (ast/compute
-                          [n-rows] "expanded-distances" nil
-                          [row-idx]
-                          (ast/commutative-reduce
-                           [:+ :float64]
-                           [{:domain [0 n-cols] :name "col-idx"}]
-                           [(fn [col-idx] (ast/tget squared-diff [row-idx col-idx]))]))
-                         (ast/first-output))
-        ;;Aggregate previous distances, new distance into result.
-        mindistances (-> (ast/compute
-                          [n-rows] "mindistances" nil
-                          [row-idx]
-                          (ast/tvm-let
-                           [prev-dist (ast-op/select (ast-op/eq center-idx 0)
-                                                     (ast-op/max-value :float64)
-                                                     (ast/tget distances [row-idx]))
-                            cur-dist (-> (ast/tget squared-dist [row-idx])
-                                         (ast-op/cast :float64))]
-                           (ast-op/min cur-dist prev-dist)))
-                         (ast/first-output))
-
-        ;;Produce the cumulative summation vector.  For this system, we define the
-        ;;algorithm in terms of timesteps.  We should have n-rows timesteps for our
-        ;;algorithm state.
-        scan-state (ast/placeholder [n-rows] "scan_state" :dtype :float64)
-
-        scan-result (-> (ast/scan
-                         ;;First compute op sets up initial state at timestep 0.  This
-                         ;;could setup an arbitrary amount of initial state.
-                         (ast/compute [1] "init" nil
-                                      [row-idx]
-                                      (ast/tget mindistances [row-idx]))
-                         ;;Next we describe our recursive update in terms of reading
-                         ;;from the state vector at previous timesteps and we can read
-                         ;;from anything else at the current timestep.
-                         (ast/compute [n-rows] "update" nil
-                                      [ts-idx]
-                                      (ast-op/+
-                                       ;;grab stage from ts-1
-                                       (ast/tget scan-state [(ast-op/- ts-idx (int 1))])
-                                       ;;add to incoming values
-                                       (ast/tget mindistances [ts-idx])))
-                         ;;State of scan algorithm.  Must have enough dimensions for
-                         ;;each timestep as well as result
-                         scan-state
-                         ;;incoming values
-                         [mindistances]
-                         {:name "distance_scan"})
-                        (ast/first-output))
-        schedule (-> (schedule/create-schedule scan-result)
-                     (schedule/inline-op squared-diff squared-dist -1)
-                     (schedule/inline-op squared-dist mindistances 0)
-                     (schedule/parallelize-axis mindistances 0))]
-    {:arguments [dataset centroids center-idx distances mindistances scan-result]
-     :schedule schedule}))
-
-
-(def ^:private tvm-next-centroid*
-  (delay
-   (let [raw-tvm-fn (compiler/ir->fn (tvm-dist-sum-algo 3 :uint8) "dist_sum")]
-     (fn [dataset centroids idx distances scan-distances]
-       (let [distances (dtt/as-tensor distances)]
-         (raw-tvm-fn (dtt/as-tensor dataset)
-                     (dtt/as-tensor centroids)
-                     idx
-                     distances
-                     distances
-                     (dtt/as-tensor scan-distances)))))))
-
-
 (defn- choose-centroids++
   "Implementation of the kmeans++ center choosing algorithm."
   [dataset n-centroids {:keys [seed
@@ -212,6 +117,37 @@
       centroids)))
 
 
+(defrecord AggReduceContext [^doubles center
+                             ^longs n-rows])
+
+
+(defn- new-center-reduction
+  ^IndexReduction [dataset]
+  (let [[_nrows n-cols] (dtype/shape dataset)
+        dataset (dtype/->buffer dataset)
+        make-reduce-context #(->AggReduceContext (double-array n-cols)
+                                                 (long-array 1))
+        n-cols (long n-cols)]
+    (reify IndexReduction
+      (reduceIndex [this batch ctx row-idx]
+        (let [^AggReduceContext ctx (or ctx (make-reduce-context))
+              row-off (* n-cols row-idx)]
+          (dotimes [col-idx n-cols]
+            (ArrayHelpers/accumPlus ^doubles (.center ctx) col-idx
+                                    (.readDouble dataset (+ row-off col-idx))))
+          (ArrayHelpers/accumPlus ^longs (.n-rows ctx) 0 1)
+          ctx))
+      (reduceReductions [this lhsCtx rhsCtx]
+        (let [^AggReduceContext lhsCtx lhsCtx
+              ^AggReduceContext rhsCtx rhsCtx]
+          (dotimes [col-idx n-cols]
+            (ArrayHelpers/accumPlus ^doubles (.center lhsCtx) col-idx
+                                    (aget ^doubles (.center rhsCtx) col-idx)))
+          (ArrayHelpers/accumPlus ^longs (.n-rows lhsCtx) 0
+                                  (aget ^longs (.n-rows rhsCtx) 0))
+          lhsCtx)))))
+
+
 (defn- jvm-assign-centroids
   [dataset centroids centroid-indexes]
   (let [dataset (dtt/as-tensor dataset)
@@ -222,33 +158,71 @@
         [ncentroids,ncols] (dtype/shape centroids)
         nrows (long nrows)
         ncols (long ncols)
-        ncentroids (long ncentroids)]
-    (pfor/indexed-map-reduce
-     nrows
-     (fn [^long start-idx ^long group-len]
-       (let [end-row (+ start-idx group-len)]
-         (loop [row-idx start-idx
-                sum 0.0]
-           (if (< row-idx end-row)
-             (let [[dist cent-idx]
-                   (loop [cent-idx 0
-                          mindist Double/MAX_VALUE
-                          minidx 0]
-                     (if (< cent-idx ncentroids)
-                       (let [newdist (distance-squared dataset centroids row-idx
-                                                       cent-idx ncols)
-                             minidx (if (< newdist mindist)
-                                      cent-idx
-                                      minidx)
-                             mindist (if (< newdist mindist)
-                                       newdist
-                                       mindist)]
-                         (recur (unchecked-inc cent-idx) mindist minidx))
-                       [mindist minidx]))]
-               (.writeLong centroid-indexes row-idx cent-idx)
-               (recur (unchecked-inc row-idx) (+ sum (double dist))))
-             sum))))
-     (partial reduce +))))
+        ncentroids (long ncentroids)
+        reducer (new-center-reduction dataset)
+        merge-bifn (reify BiFunction
+                     (apply [this lhs rhs]
+                       (.reduceReductions reducer lhs rhs)))]
+    (let [[score center-map]
+          (pfor/indexed-map-reduce
+           nrows
+           (fn [^long start-idx ^long group-len]
+             (let [end-row (+ start-idx group-len)
+                   center-map (java.util.HashMap.)
+                   bifn (IndexReduction$IndexedBiFunction. reducer nil)]
+               (loop [row-idx start-idx
+                      sum 0.0]
+                 (if (< row-idx end-row)
+                   (let [[dist cent-idx]
+                         (loop [cent-idx 0
+                                mindist Double/MAX_VALUE
+                                minidx 0]
+                           (if (< cent-idx ncentroids)
+                             (let [newdist (distance-squared dataset centroids row-idx
+                                                             cent-idx ncols)
+                                   minidx (if (< newdist mindist)
+                                            cent-idx
+                                            minidx)
+                                   mindist (if (< newdist mindist)
+                                             newdist
+                                             mindist)]
+                               (recur (unchecked-inc cent-idx) mindist minidx))
+                             [mindist minidx]))]
+                     (.setIndex bifn row-idx)
+                     (.compute center-map cent-idx bifn)
+                     (recur (unchecked-inc row-idx) (+ sum (double dist))))
+                   [sum center-map]))))
+           (partial reduce (fn [[rsum ^HashMap rcenter-map] [sum ^HashMap center-map]]
+                             (.forEach center-map
+                                       (reify BiConsumer
+                                         (accept [this k v]
+                                           (.merge rcenter-map k v merge-bifn))))
+                             [(+ (double rsum) (double sum)) rcenter-map])))
+          new-centroids (dtt/new-tensor (dtype/shape centroids) :datatype :float64)]
+      (.forEach ^HashMap center-map
+                (reify BiConsumer
+                  (accept [this center-idx reduce-context]
+                    (let [^doubles center (:center reduce-context)
+                          ^longs n-rows (:n-rows reduce-context)]
+                      (dtt/mset! new-centroids center-idx
+                                 (dfn// center (aget n-rows 0)))))))
+      [score new-centroids])))
+
+
+(defn jvm-assign-centers-from-centroid-indexes
+  [dataset center-indexes]
+  (let [reducer (new-center-reduction dataset)
+        center-map (reductions/ordered-group-by-reduce reducer nil center-indexes)
+        new-centroids (dtt/new-tensor [(count center-map)
+                                     (second (dtype/shape dataset))])]
+    (.forEach ^HashMap center-map
+              (reify BiConsumer
+                (accept [this center-idx reduce-context]
+                  (let [^doubles center (:center reduce-context)
+                        ^longs n-rows (:n-rows reduce-context)]
+                    (dtt/mset! new-centroids center-idx
+                               (dfn// center (aget n-rows 0)))))))
+    new-centroids))
 
 
 (comment
@@ -275,7 +249,13 @@
                         dataset 5 {:seed 5 :distance-fn @tvm-next-centroid*})))
   ;; 345ms
   (def score (time (assign-centroids dataset centroids centroid-indexes)))
-  ;;1789ms
+  ;; 103ms
+  (def score (time (assign-centroids-imr dataset centroids centroid-indexes)))
+  ;; 103ms
   (def score (time (jvm-assign-centroids dataset centroids centroid-indexes)))
   ;; 775ms
+
+  (def jvm-centroids
+    (time (jvm-assign-centers-from-centroid-indexes dataset centroid-indexes)))
+  ;; 169ms
   )
