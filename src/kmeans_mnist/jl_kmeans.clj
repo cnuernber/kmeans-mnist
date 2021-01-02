@@ -27,6 +27,7 @@
   (def kmeans-next-centroid (jl "kmeans_next_centroid"))
   (def assign-centroids (jl "assign_centroids"))
   (def assign-centroids-imr (jl "assign_centroids_imr"))
+  (def assign-calc-centroids (jl "assign_calc_centroids"))
   (def score-kmeans (jl "score_kmeans")))
 
 
@@ -258,4 +259,8 @@
   (def jvm-centroids
     (time (jvm-assign-centers-from-centroid-indexes dataset centroid-indexes)))
   ;; 169ms
+
+  (def jl-centroids (time (assign-calc-centroids dataset centroids)))
+  ;; 400ms -> 1700ms, varying
+  (jl "ccall(:jl_in_threaded_region, Cint, ())")
   )
