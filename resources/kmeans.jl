@@ -3,38 +3,54 @@ using StaticArrays
 
 function indexed_map_reduce(num_iters::Int,
                             index_map_fn,
-                            reduce_fn)
+                            reduce_fn=nothing)
     parallelism = Threads.nthreads()
     if (num_iters < (2 * parallelism)
+        || ccall(:jl_in_threaded_region, Cint, ()) != 0
         || parallelism <= 1)
-        reduce_fn([index_map_fn(1, num_iters)])
+        int_data = index_map_fn(1, num_iters)
+        if reduce_fn != nothing
+            reduce_fn([int_data])
+        end
     else
-        group_len, rem = divrem(num_iters, parallelism)
-        # Launch all the tasks
-        tasks = map(function (idx::Int)
-                      # Zero based seems simpler here
-                      idx = idx - 1
-                      any_leftover = idx < rem
-                      start_idx = idx * group_len + 1
-                      if any_leftover
-                        start_idx += idx
-                      else
-                        start_idx += rem
-                      end
-                      llen = group_len
-                      if any_leftover
-                        llen += 1
-                      end
-                    Threads.@spawn begin
-                                     ccall(:jl_enter_threaded_region, Cvoid, ())
-                                     retval = index_map_fn(start_idx, llen)
-                                     ccall(:jl_exit_threaded_region, Cvoid, ())
-                                     retval
-                                   end
-                    end,
-                    Base.OneTo(parallelism))
-        # reduce result
-        reduce_fn(map(Threads.fetch, tasks))
+        ccall(:jl_enter_threaded_region, Cvoid, ())
+        tasks = Vector{Task}(undef, parallelism)
+        try
+            group_len, rem = divrem(num_iters, parallelism)
+            for idx = 1:parallelism
+                didx = idx - 1
+                any_leftover = didx < rem
+                # back to 1 based
+                start_idx = didx * group_len + 1
+                llen = group_len
+                if any_leftover
+                    start_idx += didx
+                    llen += 1
+                else
+                    start_idx += rem
+                end
+                t = Task(function() index_map_fn(start_idx, llen) end)
+                t.sticky = true
+                ccall(:jl_set_task_tid, Cvoid, (Any, Cint), t, idx-1)
+                tasks[idx] = t
+                schedule(t)
+            end
+        finally
+            ccall(:jl_exit_threaded_region, Cvoid, ())
+        end
+        if (reduce_fn != nothing)
+            # Perhaps type the intermediate result
+            results = Vector{Any}(undef, parallelism)
+            for idx = 1:parallelism
+                results[idx] = fetch(tasks[idx])
+            end
+            # reduce results into one result
+            reduce_fn(results)
+        else
+            for idx = 1:parallelism
+                wait(tasks[idx])
+            end
+        end
     end
 end
 
@@ -126,54 +142,41 @@ function assign_centroids_imr(dataset::Array{D,2},
 end
 
 
-function inner_assign_calc_centroids(dataset::Array{D,2},
-                                     centroid_ary,
-                                     row_start::Int,
-                                     n_rows::Int) where D
-    score = 0.0
-    n_centroids = length(centroid_ary)
-    n_cols = length(centroid_ary[1])
-    new_centroids = zeros(Float64,n_cols,n_centroids)
-    centroid_row_counts = zeros(Int32,n_centroids)
-    # Parallelized in outer loop.
-    for row_idx in range(row_start,length=n_rows)
-        dataset_row = @view dataset[:,row_idx]
-        (mindistance,minindex) = centroid_distance_index(dataset_row, centroid_ary)
-        # use java zero-based indexing here
-        @inbounds new_centroids[:,minindex] .+= dataset_row
-        @inbounds centroid_row_counts[minindex] += 1
-        score += mindistance
-    end
-    return (score,new_centroids,centroid_row_counts)
-end
-
-
 function reduce_calc_centroids(result_ary::Array{Tuple{Float64,Array{Float64,2},Array{Int32,1}},1})
     score, new_centroids, centroid_row_counts = result_ary[1]
-    @fastmath @simd for res_idx in range(2, length=(length(result_ary)-1))
-        ns, nc, nrc = result_ary[res_idx]
-        score += ns
-        new_centroids .+= nc
-        centroid_row_counts .+= nrc
-    end
-    @fastmath @simd for row_idx in eachindex(centroid_row_counts)
-        new_centroids[:,row_idx] ./= centroid_row_counts[row_idx]
-    end
-    score, new_centroids
 end
 
 
 function assign_calc_centroids(dataset::Array{D,2},
-                               centroids::Array{Float64,2}) where D
+                               centroids::Array{Float64,2},
+                               result_centroids::Array{Float64,2}) where D
     ncols,nrows = size(dataset)
     ncols,ncentroids = size(centroids)
     # score = Threads.Atomic{Float64}(0.0)
     centroid_ary = copy(reinterpret(SVector{ncols,Float64},centroids))
+    nthreads = Threads.nthreads()
+    new_centroids = MArray{Tuple{ncols, ncentroids, nthreads}, Float64}(undef)
+    row_counts = MArray{Tuple{ncentroids, nthreads}, Int32}(undef)
+    scores = MArray{Tuple{nthreads}, Float64}(undef)
+    new_centroids .= 0.0
+    row_counts .= 0
     indexed_map_reduce(nrows,
-                       function(s,gl)
-                         inner_assign_calc_centroids(dataset, centroid_ary, s, gl)
-                       end,
-                       reduce_calc_centroids)
+                       function(row_start::Int, nrows::Int)
+                         threadid = Threads.threadid()
+                         # Parallelized in outer loop.
+                         for row_idx in range(row_start,length=nrows)
+                           dataset_row = @view dataset[:,row_idx]
+                           (mindistance,minindex) = centroid_distance_index(dataset_row, centroid_ary)
+                           # use java zero-based indexing here
+                           @inbounds new_centroids[:,minindex,threadid] .+= dataset_row
+                           @inbounds row_counts[minindex,threadid] += 1
+                           scores[threadid] += mindistance
+                         end
+                       end)
+    sum!(result_centroids, new_centroids)
+    cumsum!(row_counts, row_counts, dims=2)
+    result_centroids' ./= row_counts[:,nthreads]
+    sum(scores)
 end
 
 

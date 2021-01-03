@@ -238,6 +238,9 @@
                      (julia/->array)))
     (def centroid-indexes (-> (dtt/new-tensor [nrows] :datatype :int32)
                               (julia/->array)))
+
+    (def new-centroids (-> (dtt/new-tensor [5 ncols] :datatype :float64)
+                           (julia/->array)))
     )
 
   (def centroids (time (choose-centroids++
@@ -260,7 +263,7 @@
     (time (jvm-assign-centers-from-centroid-indexes dataset centroid-indexes)))
   ;; 169ms
 
-  (def jl-centroids (time (assign-calc-centroids dataset centroids)))
+  (def jl-centroids (time (assign-calc-centroids dataset centroids new-centroids)))
   ;; 400ms -> 1700ms, varying
   (jl "ccall(:jl_in_threaded_region, Cint, ())")
   )
