@@ -155,8 +155,10 @@ function assign_calc_centroids(dataset::Array{D,2},
     # score = Threads.Atomic{Float64}(0.0)
     centroid_ary = copy(reinterpret(SVector{ncols,Float64},centroids))
     nthreads = Threads.nthreads()
-    new_centroids = MArray{Tuple{ncols, ncentroids, nthreads}, Float64}(undef)
-    row_counts = MArray{Tuple{ncentroids, nthreads}, Int32}(undef)
+    # Changing these to MArrays makes things a lot faster at the cost of
+    # massive compile times.
+    new_centroids = Array{Float64,3}(undef, ncols, ncentroids, nthreads)
+    row_counts = Array{Int32, 2}(undef, ncentroids, nthreads)
     scores = MArray{Tuple{nthreads}, Float64}(undef)
     new_centroids .= 0.0
     row_counts .= 0
@@ -184,11 +186,16 @@ function score_kmeans(dataset, centroids)
     ncols,nrows = size(dataset)
     ncols,ncentroids = size(centroids)
     score = 0.0
-    Threads.@threads for row_idx in 1:nrows
-        row = dataset[:,row_idx]
-        (mindistance,minindex) = centroid_distance_index(row, centroids,
-                                                         ncentroids, ncols)
-        score += mindistance
-    end
-    score
+    centroid_ary = copy(reinterpret(SVector{ncols,Float64},centroids))
+    indexed_map_reduce(nrows,
+                       function(s,gl)
+                         score = 0.0
+                         for row_idx in range(s,length=gl)
+                          dataset_row = @view dataset[:,row_idx]
+                          (mindistance,minindex) = centroid_distance_index(dataset_row, centroid_ary)
+                          score += mindistance
+                         end
+                         score
+                       end,
+                       sum)
 end

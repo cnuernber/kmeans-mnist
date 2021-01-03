@@ -8,7 +8,8 @@
             [tech.v3.parallel.for :as pfor]
             [tech.v3.datatype.reductions :as reductions]
             [tech.v3.libs.buffered-image :as bufimg]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [clojure.tools.logging :as log])
   (:import [java.util Random HashMap]
            [java.util.function BiFunction BiConsumer]
            [tech.v3.datatype ArrayHelpers IndexReduction
@@ -260,10 +261,106 @@
   ;; 775ms
 
   (def jvm-centroids
-    (time (jvm-assign-centers-from-centroid-indexes dataset centroid-indexes)))
-  ;; 169ms
+    (time (do
+            (assign-centroids-imr dataset centroids centroid-indexes)
+            (jvm-assign-centers-from-centroid-indexes dataset centroid-indexes))))
+  ;; 200ms
 
   (def jl-centroids (time (assign-calc-centroids dataset centroids new-centroids)))
   ;; 400ms -> 1700ms, varying
   (jl "ccall(:jl_in_threaded_region, Cint, ())")
+  )
+
+
+(defn kmeans++
+  "Find K cluster centroids via kmeans++ center initialization
+  followed by Lloyds algorithm.
+  Dataset must be a matrix (2d tensor).
+
+  * `dataset` - 2d matrix of numeric datatype.
+  * `n-centroids` - How many centroids to find.
+
+  Returns map of:
+
+  * `:centroids` - 2d tensor of double centroids
+  * `:centroid-indexes` - 1d integer vector of assigned center indexes.
+  * `:iteration-scores` - n-iters+1 length array of mean squared error scores container
+    the scores from centroid assigned up to the score when the algorithm
+    terminates.
+
+  Options:
+
+  * `:minimal-improvement-threshold` - defaults to 0.01 - algorithm terminates if
+     (1.0 - error(n-1)/error(n-2)) < error-diff-threshold.  When Zero means algorithm will
+     always train to max-iters.
+  * `:n-iters` - defaults to 100 - Max number of iterations, algorithm terminates
+     if `(>= iter-idx n-iters).
+  * `:rand-seed` - integer or implementation of `java.util.Random`."
+  [dataset n-centroids & [{:keys [n-iters rand-seed
+                                  minimal-improvement-threshold]
+                           :or {minimal-improvement-threshold 0.01}
+                           :as options}]]
+  (errors/when-not-error
+   (== 2 (dtype/ecount (dtype/shape dataset)))
+   "Dataset must be a matrix of rank 2")
+  (let [[n-rows n-cols] (dtype/shape dataset)
+        ds-dtype (dtype/elemwise-datatype dataset)
+        n-iters (long (or n-iters 100))
+        minimal-improvement-threshold (double (or minimal-improvement-threshold
+                                                  0.011))]
+    (log/infof "Choosing n-centroids %d with %f improvement threshold and max %d iters"
+               n-centroids minimal-improvement-threshold n-iters)
+    (let [dataset (julia/->array dataset)
+          centroids (if (number? n-centroids)
+                      (choose-centroids++ dataset n-centroids
+                                          {:seed rand-seed
+                                           :distance-fn kmeans-next-centroid})
+                      (do
+                        (errors/when-not-error
+                            (== 2 (count (dtype/shape n-centroids)))
+                          "Centroids must be rank 2")
+                        (julia/->array n-centroids)))
+          centroid-indexes (julia/->array (dtt/new-tensor [n-rows]  :datatype :int32))
+          dec-n-iters (dec n-iters)
+          n-rows (long n-rows)
+          scores (if-not (== 0 n-iters)
+                   (loop [iter-idx 0
+                          last-score 0.0
+                          scores []]
+                     (let [score (assign-centroids-imr dataset centroids
+                                                       centroid-indexes)
+                           new-centroids (jvm-assign-centers-from-centroid-indexes
+                                          dataset centroid-indexes)
+                           score (/ (double score) n-rows)
+                           rel-score (if-not (== 0.0 last-score)
+                                       (- 1.0 (/ score last-score))
+                                       1.0)]
+                       (dtype/copy! new-centroids centroids)
+                       (log/infof "Iteration %d out of %d - relative improvement %f->%f=%f"
+                                  iter-idx n-iters last-score score rel-score)
+                       (if (and (< iter-idx dec-n-iters)
+                                (not= 0.0 score)
+                                (> rel-score minimal-improvement-threshold))
+                         (recur (unchecked-inc iter-idx) score (conj scores score))
+                         scores)))
+                   [])
+          final-score (score-kmeans dataset centroids)]
+      ;;Clone data back into jvm land to escape the resource context
+      {:centroids (dtt/clone centroids)
+       :centroid-indexes (dtt/clone centroid-indexes)
+       :iteration-scores (vec (concat scores [(/ (double final-score)
+                                                 (double n-rows))]))})))
+
+
+(comment
+  (do
+    (def src-image (bufimg/load "data/jen.jpg"))
+    (def img-height (first (dtype/shape src-image)))
+    (def img-width (second (dtype/shape src-image)))
+    (def nrows (* img-width img-height))
+    (def ncols (/ (dtype/ecount src-image) nrows))
+    (def dataset (-> (dtt/reshape src-image [nrows ncols]))))
+
+  (def img-data (time (kmeans++ dataset 5 {:rand-seed 5})))
+  ;;2716ms
   )
