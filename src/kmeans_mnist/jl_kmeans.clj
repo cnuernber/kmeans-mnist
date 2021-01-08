@@ -20,7 +20,8 @@
 (set! *unchecked-math* :warn-on-boxed)
 
 
-(defonce init* (delay (julia/initialize! {:n-threads -1})))
+(defonce init* (delay (julia/initialize! {:n-threads -1
+                                          :optimization-level 3})))
 @init*
 
 (do
@@ -29,7 +30,10 @@
   (def assign-centroids (jl "assign_centroids"))
   (def assign-centroids-imr (jl "assign_centroids_imr"))
   (def assign-calc-centroids (jl "assign_calc_centroids"))
-  (def score-kmeans (jl "score_kmeans")))
+  (def score-kmeans (jl "score_kmeans"))
+  (def order-data-labels (jl "order_data_labels"))
+  (def per-label-infer (jl "per_label_infer"))
+  )
 
 
 (defn- seed->random
@@ -212,11 +216,10 @@
 
 
 (defn jvm-assign-centers-from-centroid-indexes
-  [dataset center-indexes]
+  [dataset n-centers center-indexes]
   (let [reducer (new-center-reduction dataset)
         center-map (reductions/ordered-group-by-reduce reducer nil center-indexes)
-        new-centroids (dtt/new-tensor [(count center-map)
-                                     (second (dtype/shape dataset))])]
+        new-centroids (dtt/new-tensor [n-centers (second (dtype/shape dataset))])]
     (.forEach ^HashMap center-map
               (reify BiConsumer
                 (accept [this center-idx reduce-context]
@@ -263,7 +266,9 @@
   (def jvm-centroids
     (time (do
             (assign-centroids-imr dataset centroids centroid-indexes)
-            (jvm-assign-centers-from-centroid-indexes dataset centroid-indexes))))
+            (jvm-assign-centers-from-centroid-indexes dataset
+                                                      (count centroids)
+                                                      centroid-indexes))))
   ;; 200ms
 
   (def jl-centroids (time (assign-calc-centroids dataset centroids new-centroids)))
@@ -330,7 +335,7 @@
                      (let [score (assign-centroids-imr dataset centroids
                                                        centroid-indexes)
                            new-centroids (jvm-assign-centers-from-centroid-indexes
-                                          dataset centroid-indexes)
+                                          dataset n-centroids centroid-indexes)
                            score (/ (double score) n-rows)
                            rel-score (if-not (== 0.0 last-score)
                                        (- 1.0 (/ score last-score))
@@ -364,3 +369,83 @@
   (def img-data (time (kmeans++ dataset 5 {:rand-seed 5})))
   ;;2716ms
   )
+
+
+(defn- concatenate-results
+  "Given a sequence of maps, return one result map with
+  tensors with one extra dimension.  Works when every result has the
+  same length."
+  [result-seq]
+  (when (seq result-seq)
+    (->> (first result-seq)
+         (map (fn [[k v]]
+                [k (dtt/->tensor (mapv k result-seq)
+                                 :datatype (dtype/elemwise-datatype v))]))
+         (into {}))))
+
+
+(defn train-per-label
+  "Given a dataset along with per-row integer labels, train N per-label
+  kmeans centroids returning a model which you can use can use with predict-per-label."
+  [data labels n-per-label & [{:keys [input-ordered?]
+                               :as options}]]
+  (when-not (empty? labels)
+    ;;Organize data per-label
+    (let [n-per-label (long n-per-label)
+          ds-dtype (dtype/elemwise-datatype data)
+          [data labels] (if input-ordered?
+                          [(julia/->array data) (julia/->array labels)]
+                          ;;Order data and labels by increasing index
+                          (order-data-labels (julia/->array data)
+                                             (julia/->array labels)))
+          [n-rows n-cols] (dtype/shape data)
+          labels (->> (argops/arggroup labels)
+                      (into {})
+                      (sort-by first)
+                      ;;arggroup be default uses an 'ordered' algorithm that guarantees
+                      ;;the result index list is ordered.
+                      (mapv (fn [[label idx-list]]
+                              [label
+                               [(first idx-list) (last idx-list)]])))
+          n-labels (count labels)]
+      (->> labels
+           (map (fn [[label [^long idx-start ^long past-idx-end]]]
+                  ;;Tensor selection from contiguous data of a range with an increment of 1
+                  ;;is guaranteed to produce contiguous data
+                  (log/infof "Training centroids for label %s" label)
+                  (let [{:keys [centroids centroid-indexes iteration-scores]}
+                        (-> (dtt/select data (range idx-start past-idx-end))
+                            (kmeans++ n-per-label options))]
+                    {:centroids centroids
+                     :labels label
+                     :iteration-scores (last iteration-scores)})))
+           (concatenate-results)
+           (merge {:kmeans-type :n-per-label})))))
+
+
+(defn predict-per-label
+  "Return both a probability distribution per row across each label and
+  a 1d tensor of assigned label indexes.
+
+  Returns:
+
+  * `:probability-distribution` - each row sums to one, max prob is the index picked.
+  * `:label-indexes` - int32 assigned indexes for each row in the dataset."
+  [dataset model]
+  (let [{:keys [centroids labels]} model
+        [n-labels n-per-label n-cols] (dtype/shape centroids)]
+    ;;Eventually we will have a resource context here
+    (let [[n-labels n-per-label n-cols] (dtype/shape centroids)
+          [n-rows n-data-cols] (dtype/shape dataset)
+          _ (errors/when-not-errorf
+                (= n-cols n-data-cols)
+              "Data (%d), model (%d) have different feature counts"
+              n-data-cols n-cols)
+          dataset (julia/->array dataset)
+          n-centroids (* (long n-labels)
+                         (long n-per-label))
+          centroids (-> (dtt/reshape centroids [n-centroids n-cols])
+                        (julia/->array))
+          indexes (julia/new-array [n-rows] :int32)]
+      (per-label-infer dataset centroids n-labels indexes)
+      {:label-indexes (dtype/clone indexes)})))

@@ -1,4 +1,3 @@
 {:deps {org.clojure/clojure            {:mvn/version "1.10.2-alpha2"}
-        cnuernber/libjulia-clj         {:mvn/version "0.05"}
-        tvm-clj                        {:mvn/version "6.00-beta-1-SNAPSHOT"}}
+        cnuernber/libjulia-clj         {:mvn/version "0.06-SNAPSHOT"}}
  :paths ["src" "resources"]}
