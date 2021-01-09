@@ -19,13 +19,17 @@
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
 
-
+;; If you enable threads in Julia JVM signal forwarding must be enabled
 (defonce init* (delay (julia/initialize! {:n-threads -1
                                           :optimization-level 3})))
 @init*
 
+;; Use to make sure memory is being released as it should be
 (julia/set-julia-gc-root-log-level! :info)
 
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Loading initial julia symbols
 (do
   (def loader (jl (slurp (io/resource "kmeans.jl"))))
   (def kmeans-next-centroid (jl "kmeans_next_centroid"))
@@ -38,17 +42,8 @@
   )
 
 
-(defn- seed->random
-  ^Random [seed]
-  (cond
-    (number? seed)
-    (Random. (int seed))
-    (instance? Random seed)
-    seed
-    (nil? seed)
-    (Random.)
-    :else
-    (errors/throwf "Unrecognized seed type: %s" seed)))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Clojure versions of some functions for performance comparison
 
 (defmacro distance-squared
   [dataset centroids row-idx centroid-idx ncols]
@@ -84,6 +79,19 @@
                         (+ (.readDouble scan-distances (unchecked-dec idx))
                            (.readDouble distances idx)))
         (recur (unchecked-inc idx))))))
+
+
+(defn- seed->random
+  ^Random [seed]
+  (cond
+    (number? seed)
+    (Random. (int seed))
+    (instance? Random seed)
+    seed
+    (nil? seed)
+    (Random.)
+    :else
+    (errors/throwf "Unrecognized seed type: %s" seed)))
 
 
 (defn- choose-centroids++
@@ -156,68 +164,8 @@
                                   (aget ^longs (.n-rows rhsCtx) 0))
           lhsCtx)))))
 
-
-(defn- jvm-assign-centroids
-  [dataset centroids centroid-indexes]
-  (let [dataset (dtt/as-tensor dataset)
-        centroids (dtt/as-tensor centroids)
-        ;;Use 1d indexing
-        centroid-indexes (dtype/->buffer centroid-indexes)
-        [nrows,ncols] (dtype/shape dataset)
-        [ncentroids,ncols] (dtype/shape centroids)
-        nrows (long nrows)
-        ncols (long ncols)
-        ncentroids (long ncentroids)
-        reducer (new-center-reduction dataset)
-        merge-bifn (reify BiFunction
-                     (apply [this lhs rhs]
-                       (.reduceReductions reducer lhs rhs)))]
-    (let [[score center-map]
-          (pfor/indexed-map-reduce
-           nrows
-           (fn [^long start-idx ^long group-len]
-             (let [end-row (+ start-idx group-len)
-                   center-map (java.util.HashMap.)
-                   bifn (IndexReduction$IndexedBiFunction. reducer nil)]
-               (loop [row-idx start-idx
-                      sum 0.0]
-                 (if (< row-idx end-row)
-                   (let [[dist cent-idx]
-                         (loop [cent-idx 0
-                                mindist Double/MAX_VALUE
-                                minidx 0]
-                           (if (< cent-idx ncentroids)
-                             (let [newdist (distance-squared dataset centroids row-idx
-                                                             cent-idx ncols)
-                                   minidx (if (< newdist mindist)
-                                            cent-idx
-                                            minidx)
-                                   mindist (if (< newdist mindist)
-                                             newdist
-                                             mindist)]
-                               (recur (unchecked-inc cent-idx) mindist minidx))
-                             [mindist minidx]))]
-                     (.setIndex bifn row-idx)
-                     (.compute center-map cent-idx bifn)
-                     (recur (unchecked-inc row-idx) (+ sum (double dist))))
-                   [sum center-map]))))
-           (partial reduce (fn [[rsum ^HashMap rcenter-map] [sum ^HashMap center-map]]
-                             (.forEach center-map
-                                       (reify BiConsumer
-                                         (accept [this k v]
-                                           (.merge rcenter-map k v merge-bifn))))
-                             [(+ (double rsum) (double sum)) rcenter-map])))
-          new-centroids (dtt/new-tensor (dtype/shape centroids) :datatype :float64)]
-      (.forEach ^HashMap center-map
-                (reify BiConsumer
-                  (accept [this center-idx reduce-context]
-                    (let [^doubles center (:center reduce-context)
-                          ^longs n-rows (:n-rows reduce-context)]
-                      (dtt/mset! new-centroids center-idx
-                                 (dfn// center (aget n-rows 0)))))))
-      [score new-centroids])))
-
-
+;; It was fastest to use a combined kmeans iteration.  Julia to assign indexes
+;; and the JVM to sum rows into new centroids
 (defn jvm-assign-centers-from-centroid-indexes
   [dataset n-centers center-indexes]
   (let [reducer (new-center-reduction dataset)
@@ -253,9 +201,7 @@
   (def centroids (time (choose-centroids++
                         dataset 5 {:seed 5 :distance-fn jvm-next-centroid})))
   ;;1163ms
-  (def centroids (time (choose-centroids++
-                        dataset 5 {:seed 5 :distance-fn @tvm-next-centroid*})))
-  ;; 345ms
+
   (def score (time (assign-centroids dataset centroids centroid-indexes)))
   ;; 103ms
   (def score (time (assign-centroids-imr dataset centroids centroid-indexes)))
