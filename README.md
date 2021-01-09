@@ -62,6 +62,10 @@ to efficiently declare context local to a thread before iterating through the
 indexes of the parallelization.  This allows a very efficient multithreaded form
 of reduction.
 
+Copying data between the two languages is optimized; as long as the datatypes
+match a jvm-heap or native-heap backed tensor will have an optimized pathway
+to Julia.
+
 
 * [Externally defined Julia code](resources/kmeans.jl)
 * [Calling Julia like Clojure](src/kmeans_mnist/jl_kmeans.clj)
