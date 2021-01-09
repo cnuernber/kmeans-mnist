@@ -1,7 +1,7 @@
-# Julia/Clojure KMeans-MNist
+# Julia/Clojure KMeans-MNIST
 
 An example of using using Clojure and Julia to implement KMeans to 
-create an mnist classifier which performs extremely well and does 
+create an MNIST classifier which performs extremely well and does 
 surprisingly well on mnist.
 
 
