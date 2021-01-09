@@ -1,3 +1,5 @@
 {:deps {org.clojure/clojure            {:mvn/version "1.10.2-alpha2"}
-        cnuernber/libjulia-clj         {:mvn/version "0.06-SNAPSHOT"}}
+        cnuernber/libjulia-clj         {:mvn/version "0.06"}
+        ;;sane logging please.
+        ch.qos.logback/logback-classic {:mvn/version  "1.2.3"}}
  :paths ["src" "resources"]}

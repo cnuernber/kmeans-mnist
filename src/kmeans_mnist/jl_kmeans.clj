@@ -24,6 +24,8 @@
                                           :optimization-level 3})))
 @init*
 
+(julia/set-julia-gc-root-log-level! :info)
+
 (do
   (def loader (jl (slurp (io/resource "kmeans.jl"))))
   (def kmeans-next-centroid (jl "kmeans_next_centroid"))
@@ -92,35 +94,36 @@
   (let [[n-rows n-cols] (dtype/shape dataset)
         ;;Remember julia is column major, so shape arguments are reversed
         centroids (julia/new-array [n-cols n-centroids] :float64)]
-    (let [centroid-tens (dtt/as-tensor centroids)
-          ds-tens (dtt/as-tensor dataset)
-          random (seed->random seed)
-          n-rows (long n-rows)
-          distances (julia/new-array [n-rows] :float64)
-          _ (dtype/set-constant! distances Double/MAX_VALUE)
-          scan-distances (julia/new-array [n-rows] :float64)
-          scan-dist-tens (dtt/as-tensor scan-distances)
-          initial-seed-idx (.nextInt random (int n-rows))
-          _ (dtt/mset! centroid-tens 0 (dtt/mget ds-tens initial-seed-idx))
-          n-centroids (long n-centroids)
-          last-idx (dec n-rows)]
-      (dotimes [idx (dec n-centroids)]
-        (distance-fn dataset centroids idx distances scan-distances)
-        (let [next-flt (.nextDouble ^Random random)
-              n-rows (dtype/ecount distances)
-              distance-sum (double (scan-dist-tens (dec n-rows)))
-              target-amt (* next-flt distance-sum)
-              next-center-idx (min last-idx
-                                   ;;You want the one just *after* where you could
-                                   ;;safely insert the distance as the next distance is
-                                   ;;likely much larger than the current distance and
-                                   ;;thus your probability of getting a vector that
-                                   ;;that is a large distance away than any known
-                                   ;;vectors is higher
-                                   (inc (argops/binary-search scan-dist-tens
-                                                              target-amt)))]
-          (dtt/mset! centroid-tens (inc idx) (dtt/mget ds-tens next-center-idx))))
-      centroids)))
+    (julia/with-stack-context
+      (let [centroid-tens (dtt/as-tensor centroids)
+            ds-tens (dtt/as-tensor dataset)
+            random (seed->random seed)
+            n-rows (long n-rows)
+            distances (julia/new-array [n-rows] :float64)
+            _ (dtype/set-constant! distances Double/MAX_VALUE)
+            scan-distances (julia/new-array [n-rows] :float64)
+            scan-dist-tens (dtt/as-tensor scan-distances)
+            initial-seed-idx (.nextInt random (int n-rows))
+            _ (dtt/mset! centroid-tens 0 (dtt/mget ds-tens initial-seed-idx))
+            n-centroids (long n-centroids)
+            last-idx (dec n-rows)]
+        (dotimes [idx (dec n-centroids)]
+          (distance-fn dataset centroids idx distances scan-distances)
+          (let [next-flt (.nextDouble ^Random random)
+                n-rows (dtype/ecount distances)
+                distance-sum (double (scan-dist-tens (dec n-rows)))
+                target-amt (* next-flt distance-sum)
+                next-center-idx (min last-idx
+                                     ;;You want the one just *after* where you could
+                                     ;;safely insert the distance as the next distance is
+                                     ;;likely much larger than the current distance and
+                                     ;;thus your probability of getting a vector that
+                                     ;;that is a large distance away than any known
+                                     ;;vectors is higher
+                                     (inc (argops/binary-search scan-dist-tens
+                                                                target-amt)))]
+            (dtt/mset! centroid-tens (inc idx) (dtt/mget ds-tens next-center-idx))))
+        centroids))))
 
 
 (defrecord AggReduceContext [^doubles center
@@ -242,9 +245,6 @@
                      (julia/->array)))
     (def centroid-indexes (-> (dtt/new-tensor [nrows] :datatype :int32)
                               (julia/->array)))
-
-    (def new-centroids (-> (dtt/new-tensor [5 ncols] :datatype :float64)
-                           (julia/->array)))
     )
 
   (def centroids (time (choose-centroids++
@@ -315,46 +315,47 @@
                                                   0.011))]
     (log/infof "Choosing n-centroids %d with %f improvement threshold and max %d iters"
                n-centroids minimal-improvement-threshold n-iters)
-    (let [dataset (julia/->array dataset)
-          centroids (if (number? n-centroids)
-                      (choose-centroids++ dataset n-centroids
-                                          {:seed rand-seed
-                                           :distance-fn kmeans-next-centroid})
-                      (do
-                        (errors/when-not-error
-                            (== 2 (count (dtype/shape n-centroids)))
-                          "Centroids must be rank 2")
-                        (julia/->array n-centroids)))
-          centroid-indexes (julia/->array (dtt/new-tensor [n-rows]  :datatype :int32))
-          dec-n-iters (dec n-iters)
-          n-rows (long n-rows)
-          scores (if-not (== 0 n-iters)
-                   (loop [iter-idx 0
-                          last-score 0.0
-                          scores []]
-                     (let [score (assign-centroids-imr dataset centroids
-                                                       centroid-indexes)
-                           new-centroids (jvm-assign-centers-from-centroid-indexes
-                                          dataset n-centroids centroid-indexes)
-                           score (/ (double score) n-rows)
-                           rel-score (if-not (== 0.0 last-score)
-                                       (- 1.0 (/ score last-score))
-                                       1.0)]
-                       (dtype/copy! new-centroids centroids)
-                       (log/infof "Iteration %d out of %d - relative improvement %f->%f=%f"
-                                  iter-idx n-iters last-score score rel-score)
-                       (if (and (< iter-idx dec-n-iters)
-                                (not= 0.0 score)
-                                (> rel-score minimal-improvement-threshold))
-                         (recur (unchecked-inc iter-idx) score (conj scores score))
-                         scores)))
-                   [])
-          final-score (score-kmeans dataset centroids)]
-      ;;Clone data back into jvm land to escape the resource context
-      {:centroids (dtt/clone centroids)
-       :centroid-indexes (dtt/clone centroid-indexes)
-       :iteration-scores (vec (concat scores [(/ (double final-score)
-                                                 (double n-rows))]))})))
+    (julia/with-stack-context
+      (let [dataset (julia/->array dataset)
+            centroids (if (number? n-centroids)
+                        (choose-centroids++ dataset n-centroids
+                                            {:seed rand-seed
+                                             :distance-fn kmeans-next-centroid})
+                        (do
+                          (errors/when-not-error
+                              (== 2 (count (dtype/shape n-centroids)))
+                            "Centroids must be rank 2")
+                          (julia/->array n-centroids)))
+            centroid-indexes (julia/->array (dtt/new-tensor [n-rows] :datatype :int32))
+            dec-n-iters (dec n-iters)
+            n-rows (long n-rows)
+            scores (if-not (== 0 n-iters)
+                     (loop [iter-idx 0
+                            last-score 0.0
+                            scores []]
+                       (let [score (assign-centroids-imr dataset centroids
+                                                         centroid-indexes)
+                             new-centroids (jvm-assign-centers-from-centroid-indexes
+                                            dataset n-centroids centroid-indexes)
+                             score (/ (double score) n-rows)
+                             rel-score (if-not (== 0.0 last-score)
+                                         (- 1.0 (/ score last-score))
+                                         1.0)]
+                         (dtype/copy! new-centroids centroids)
+                         (log/infof "Iteration %d out of %d - relative improvement %f->%f=%f"
+                                    iter-idx n-iters last-score score rel-score)
+                         (if (and (< iter-idx dec-n-iters)
+                                  (not= 0.0 score)
+                                  (> rel-score minimal-improvement-threshold))
+                           (recur (unchecked-inc iter-idx) score (conj scores score))
+                           scores)))
+                     [])
+            final-score (score-kmeans dataset centroids)]
+        ;;Clone data back into jvm land to escape the resource context
+        {:centroids (dtt/clone centroids)
+         :centroid-indexes (dtt/clone centroid-indexes)
+         :iteration-scores (vec (concat scores [(/ (double final-score)
+                                                   (double n-rows))]))}))))
 
 
 (comment
@@ -389,63 +390,65 @@
   kmeans centroids returning a model which you can use can use with predict-per-label."
   [data labels n-per-label & [{:keys [input-ordered?]
                                :as options}]]
-  (when-not (empty? labels)
-    ;;Organize data per-label
-    (let [n-per-label (long n-per-label)
-          ds-dtype (dtype/elemwise-datatype data)
-          [data labels] (if input-ordered?
-                          [(julia/->array data) (julia/->array labels)]
-                          ;;Order data and labels by increasing index
-                          (order-data-labels (julia/->array data)
-                                             (julia/->array labels)))
-          [n-rows n-cols] (dtype/shape data)
-          labels (->> (argops/arggroup labels)
-                      (into {})
-                      (sort-by first)
-                      ;;arggroup be default uses an 'ordered' algorithm that guarantees
-                      ;;the result index list is ordered.
-                      (mapv (fn [[label idx-list]]
-                              [label
-                               [(first idx-list) (last idx-list)]])))
-          n-labels (count labels)]
-      (->> labels
-           (map (fn [[label [^long idx-start ^long past-idx-end]]]
-                  ;;Tensor selection from contiguous data of a range with an increment of 1
-                  ;;is guaranteed to produce contiguous data
-                  (log/infof "Training centroids for label %s" label)
-                  (let [{:keys [centroids centroid-indexes iteration-scores]}
-                        (-> (dtt/select data (range idx-start past-idx-end))
-                            (kmeans++ n-per-label options))]
-                    {:centroids centroids
-                     :labels label
-                     :iteration-scores (last iteration-scores)})))
-           (concatenate-results)
-           (merge {:kmeans-type :n-per-label})))))
+  (julia/with-stack-context
+    (when-not (empty? labels)
+      ;;Organize data per-label
+      (let [n-per-label (long n-per-label)
+            ds-dtype (dtype/elemwise-datatype data)
+            [data labels] (if input-ordered?
+                            [(julia/->array data) (julia/->array labels)]
+                            ;;Order data and labels by increasing index
+                            (order-data-labels (julia/->array data)
+                                               (julia/->array labels)))
+            [n-rows n-cols] (dtype/shape data)
+            labels (->> (argops/arggroup labels)
+                        (into {})
+                        (sort-by first)
+                        ;;arggroup be default uses an 'ordered' algorithm that guarantees
+                        ;;the result index list is ordered.
+                        (mapv (fn [[label idx-list]]
+                                [label
+                                 [(first idx-list) (last idx-list)]])))
+            n-labels (count labels)]
+        (->> labels
+             (map (fn [[label [^long idx-start ^long past-idx-end]]]
+                    ;;Tensor selection from contiguous data of a range with an increment of 1
+                    ;;is guaranteed to produce contiguous data
+                    (log/infof "Training centroids for label %s" label)
+                    (let [{:keys [centroids centroid-indexes iteration-scores]}
+                          (-> (dtt/select data (range idx-start past-idx-end))
+                              (kmeans++ n-per-label options))]
+                      {:centroids centroids
+                       :labels label
+                       :iteration-scores (last iteration-scores)})))
+             (concatenate-results)
+             (merge {:kmeans-type :n-per-label}))))))
 
 
 (defn predict-per-label
-  "Return both a probability distribution per row across each label and
-  a 1d tensor of assigned label indexes.
+  "Using a per-label `model`, find the nearest centroid to each row
+  and return a 1d tensor of the predicted label.
 
   Returns:
 
   * `:probability-distribution` - each row sums to one, max prob is the index picked.
   * `:label-indexes` - int32 assigned indexes for each row in the dataset."
   [dataset model]
-  (let [{:keys [centroids labels]} model
-        [n-labels n-per-label n-cols] (dtype/shape centroids)]
-    ;;Eventually we will have a resource context here
-    (let [[n-labels n-per-label n-cols] (dtype/shape centroids)
-          [n-rows n-data-cols] (dtype/shape dataset)
-          _ (errors/when-not-errorf
-                (= n-cols n-data-cols)
-              "Data (%d), model (%d) have different feature counts"
-              n-data-cols n-cols)
-          dataset (julia/->array dataset)
-          n-centroids (* (long n-labels)
-                         (long n-per-label))
-          centroids (-> (dtt/reshape centroids [n-centroids n-cols])
-                        (julia/->array))
-          indexes (julia/new-array [n-rows] :int32)]
-      (per-label-infer dataset centroids n-labels indexes)
-      {:label-indexes (dtype/clone indexes)})))
+  (julia/with-stack-context
+    (let [{:keys [centroids labels]} model
+          [n-labels n-per-label n-cols] (dtype/shape centroids)]
+      ;;Eventually we will have a resource context here
+      (let [[n-labels n-per-label n-cols] (dtype/shape centroids)
+            [n-rows n-data-cols] (dtype/shape dataset)
+            _ (errors/when-not-errorf
+                  (= n-cols n-data-cols)
+                "Data (%d), model (%d) have different feature counts"
+                n-data-cols n-cols)
+            dataset (julia/->array dataset)
+            n-centroids (* (long n-labels)
+                           (long n-per-label))
+            centroids (-> (dtt/reshape centroids [n-centroids n-cols])
+                          (julia/->array))
+            indexes (julia/new-array [n-rows] :int32)]
+        (per-label-infer dataset centroids n-labels indexes)
+        {:label-indexes (dtype/clone indexes)}))))
