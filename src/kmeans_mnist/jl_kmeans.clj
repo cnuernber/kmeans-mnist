@@ -431,7 +431,6 @@
 
   Returns:
 
-  * `:probability-distribution` - each row sums to one, max prob is the index picked.
   * `:label-indexes` - int32 assigned indexes for each row in the dataset."
   [dataset model]
   (julia/with-stack-context
