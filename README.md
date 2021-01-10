@@ -1,15 +1,15 @@
 # Julia/Clojure KMeans-MNIST
 
-An example of using using Clojure and Julia to implement KMeans to 
-create an MNIST classifier which performs extremely well both in terms 
+An example of using using Clojure and Julia to implement KMeans to
+create an MNIST classifier which performs extremely well both in terms
 of accuracy and in terms of cpu time.
 
 
 ## Usage
 
-If you are on Ubuntu and using JDK 8, type 
-[`source scripts/local-julia-env`](scripts/local-julia-env) to setup the 
-julia environment.  If you are not on Ubuntu, then see the script and 
+If you are on Ubuntu and using JDK 8, type
+[`source scripts/local-julia-env`](scripts/local-julia-env) to setup the
+julia environment.  If you are not on Ubuntu, then see the script and
 change/enhance it to fit your system.
 
 From a julia prompt, install the StaticArrays package:
@@ -52,20 +52,36 @@ kmeans-mnist.mnist> data
 
 The algorithm is a modified kmeans-++ where we use a cumulative summation
 for the `++` part as opposed to a sort operation.  Next we calculate distances
-inline with finding the centroid index thus reducing algorithm steps.
+inline with finding the centroid index thus reducing algorithm steps.  We use
+Julia to implement a series of small numeric kernels that are the tight
+loops of the algorithm but we write the outer algorithm purely in Clojure.  This
+allows us to use Julia exactly where it is quite strong and use Clojure to glue
+the pieces together.  Specifically the dense arithmetic is done in Julia while
+the algorithmic outline and the centroid reduction is done in Clojure.
 
 The kmeans.jl file is somewhat type hinted to allow the Julia compiler as much
 freedom as possible to specifically optimize the code to the datatypes of the
 arguments provided as well as the number of columns.
 
-I implemented a Julia threading primitive, indexed_map_reduce that allows me 
-to efficiently declare context local to a thread before iterating through the
+I implemented a Julia threading primitive,
+[`indexed-map-reduce`](https://cnuernber.github.io/dtype-next/tech.v3.parallel.for.html#var-indexed-map-reduce)
+that allows me to efficiently declare context local to a thread before iterating through the
 indexes of the parallelization.  This allows a very efficient multithreaded form
-of reduction.
+of reduction where your reduction targets are declared on the stack and the compiler
+has full visibility of their lifetime allowing it to keep them in CPU registers or
+to declare transitive per-thread datastructures that are never visible outside the
+algorithm so for instance a hash map that is used simply inside the per-thread
+operation.
 
 Copying data between the two languages is optimized; as long as the datatypes
 match a jvm-heap or native-heap backed tensor will have an optimized pathway
 to Julia.
+
+Julia resources are never exposed to the client code; all per-kmeans-run julia objects
+are allocated within the libjulia-clj construct
+['with-stack-context'](https://cnuernber.github.io/libjulia-clj/libjulia-clj.julia.html#var-with-stack-context).
+ There is a significant performance penalty upon first call of the code as the Julia compiler
+has quite a bit of work to do.
 
 
 * [Externally defined Julia code](resources/kmeans.jl)

@@ -1,4 +1,5 @@
 (ns kmeans-mnist.jl-kmeans
+  "KMeans implementation combining Clojure and Julia"
   (:require [libjulia-clj.julia :refer [jl] :as julia]
             [tech.v3.datatype :as dtype]
             [tech.v3.datatype.argops :as argops]
@@ -95,7 +96,11 @@
 
 
 (defn- choose-centroids++
-  "Implementation of the kmeans++ center choosing algorithm."
+  "Implementation of (sort of) kmeans++ center choosing algorithm.  As opposed to
+  sorting the distances every centroid, we calculate a cumulative summation vector and
+  do a binary search within this vector.  We take the next item after the potential
+  insert position of the randomly generated target distance as this item is nearly
+  always going to be larger than the item pointed to at insert position."
   [dataset n-centroids {:keys [seed
                                distance-fn]}]
   ;;Note julia is col major but datatype is row major
