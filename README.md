@@ -64,7 +64,7 @@ freedom as possible to specifically optimize the code to the datatypes of the
 arguments provided as well as the number of columns.
 
 I implemented a Julia threading primitive,
-[`indexed-map-reduce`](https://cnuernber.github.io/dtype-next/tech.v3.parallel.for.html#var-indexed-map-reduce)
+[indexed-map-reduce](https://cnuernber.github.io/dtype-next/tech.v3.parallel.for.html#var-indexed-map-reduce)
 that allows me to efficiently declare context local to a thread before iterating through the
 indexes of the parallelization.  This allows a very efficient multithreaded form
 of reduction where your reduction targets are declared on the stack and the compiler
@@ -79,7 +79,7 @@ to Julia.
 
 Julia resources are never exposed to the client code; all per-kmeans-run julia objects
 are allocated within the libjulia-clj construct
-['with-stack-context'](https://cnuernber.github.io/libjulia-clj/libjulia-clj.julia.html#var-with-stack-context).
+[with-stack-context](https://cnuernber.github.io/libjulia-clj/libjulia-clj.julia.html#var-with-stack-context).
  There is a significant performance penalty upon first call of the code as the Julia compiler
 has quite a bit of work to do.
 
