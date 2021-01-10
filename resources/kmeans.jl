@@ -1,6 +1,11 @@
 using StaticArrays
 
-
+"""
+A simple, high performance method of implemention a multithreaded map/reduce
+algorithm.  index_map_fn is called nthreads times and takes 2 integers, 
+start_idx and group_len.   The results of the nthreads invocations
+are all then passed at once into reduce_fn.
+"""
 function indexed_map_reduce(num_iters::Int,
                             index_map_fn,
                             reduce_fn=nothing)
@@ -55,6 +60,8 @@ function indexed_map_reduce(num_iters::Int,
 end
 
 
+## Had lots of help with this from Mark.  Turns out static arrays really
+## are a ton faster than anything else.
 @inline function distance_squared(dataset_row::D,
                                   centroid::SVector{S, Float64}) where {D, S}
     sum = 0.0
@@ -64,6 +71,11 @@ end
     sum
 end
 
+"""
+Iterate through dataset mutable updating distances with the
+distance from exactly one centroid.  Then assign the cumulative
+summation of distances to scan_distances.
+"""
 function kmeans_next_centroid(dataset::Array{D,2},
                               centroids::Array{Float64,2},
                               centroid_idx::Int,
@@ -101,7 +113,15 @@ end
     return (mindistance,minindex)
 end
 
+"""
+Assign centroid indexes based on the centroid with the shorted
+distance to a given row.  Concurrently calculate and return the 
+score from the previous round.  This code shares an array between
+the threads sums into it and finally calls sum on the array.
 
+This approach is less efficient and flexible than using an 
+indexed_map_reduce.
+"""
 function assign_centroids(dataset::Array{D,2},
                           centroids::Array{Float64,2},
                           centroid_indexes::Array{Int32,1}) where D
@@ -120,7 +140,12 @@ function assign_centroids(dataset::Array{D,2},
     sum(scores)
 end
 
-
+"""
+An alternate version of assign centroids to indexes and calculate score
+using indexed_map_reduce.  This allows the code below to simply declare
+a partial summation on the stack and then sum nthreads partial summations
+as a reduction step.
+"""
 function assign_centroids_imr(dataset::Array{D,2},
                               centroids::Array{Float64,2},
                               centroid_indexes::Array{Int32,1}) where D
@@ -144,11 +169,12 @@ function assign_centroids_imr(dataset::Array{D,2},
 end
 
 
-function reduce_calc_centroids(result_ary::Array{Tuple{Float64,Array{Float64,2},Array{Int32,1}},1})
-    score, new_centroids, centroid_row_counts = result_ary[1]
-end
-
-
+## I attempted to calculate and assign centroids all in Julia and I could not get
+## the performance of the combined JVM/Julia algorithm.  Specifically the actual
+## multithreaded centroid summation turned out to be either quite a bit slower
+## than the jvm centroid summation *or* the compilation time required to get good
+## performance was longer than the time it takes to perform the entire kmeans algorithm
+## with the test set.  The function below is not used in the actual code.
 function assign_calc_centroids(dataset::Array{D,2},
                                centroids::Array{Float64,2},
                                result_centroids::Array{Float64,2}) where D
@@ -183,7 +209,9 @@ function assign_calc_centroids(dataset::Array{D,2},
     sum(scores)
 end
 
-
+"""
+Calculate the cumulative distance of the dataset from a set of centroids.
+"""
 function score_kmeans(dataset, centroids)
     ncols,nrows = size(dataset)
     ncols,ncentroids = size(centroids)
@@ -202,14 +230,21 @@ function score_kmeans(dataset, centroids)
                        sum)
 end
 
-
+"""
+Order labels such that they are linearly increasing and create
+an ordered dataset to match.  Return a tuple of dataset,labels.
+"""
 function order_data_labels(data::Array{D,2},
                            labels::Array{E,1}) where {D,E}
     indexes = sortperm(labels)
     (data[:,indexes], labels[indexes])
 end
 
-
+"""
+Infer the classification of each dataset row assuming a model where
+each label gets n centroids.  This algorithm assumes labels are the
+integers [0-N) where N is the number of labels.
+"""
 function per_label_infer(dataset::D,
                          centroids::C,
                          n_labels::Integer,
@@ -217,7 +252,6 @@ function per_label_infer(dataset::D,
     n_cols,n_rows = size(dataset)
     n_cols,n_centroids = size(centroids)
     n_per_label = n_centroids / n_labels
-    # Initially used for per-label-min values
     centroid_ary = copy(reinterpret(SVector{n_cols,Float64},centroids))
     Threads.@threads for row_idx in Base.OneTo(n_rows)
         dataset_row = @view dataset[:,row_idx]
