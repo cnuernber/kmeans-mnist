@@ -7,9 +7,10 @@ of accuracy and in terms of cpu time.
 
 ## Usage
 
-If you are on Ubuntu and using JDK 8, type `source scripts/local-julia-env` 
-to setup the julia environment.  If you are not on Ubuntu, then see the script
-and change/enhance it to fit your system.
+If you are on Ubuntu and using JDK 8, type 
+[`source scripts/local-julia-env`](scripts/local-julia-env) to setup the 
+julia environment.  If you are not on Ubuntu, then see the script and 
+change/enhance it to fit your system.
 
 From a julia prompt, install the StaticArrays package:
 
