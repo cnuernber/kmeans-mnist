@@ -1,5 +1,7 @@
 {:deps {org.clojure/clojure            {:mvn/version "1.10.2-alpha2"}
-        cnuernber/libjulia-clj         {:mvn/version "0.06"}
+        cnuernber/libjulia-clj         {:mvn/version "0.07-SNAPSHOT"}
+        cnuernber/dtype-next           {:mvn/version "6.00-beta-21-SNAPSHOT"}
         ;;sane logging please.
         ch.qos.logback/logback-classic {:mvn/version  "1.2.3"}}
- :paths ["src" "resources"]}
+ :paths ["src" "resources"]
+ :aliases {:jdk16 {:jvm-opts ["--add-modules" "jdk.incubator.foreign,jdk.incubator.vector" "-Dforeign.restricted=permit" ]}}}

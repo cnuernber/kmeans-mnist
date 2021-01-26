@@ -76,10 +76,10 @@
 (defn test-kmeans
   [& [n-centers]]
   (let [n-centers (or n-centers 10)]
-    (let [model (jl-kmeans/train-per-label (:data train-ds)
-                                           (:labels train-ds)
-                                           n-centers)
-          prediction-data (jl-kmeans/predict-per-label (:data test-ds) model)
+    (let [model (time (jl-kmeans/train-per-label (:data train-ds)
+                                                 (:labels train-ds)
+                                                 n-centers))
+          prediction-data (time (jl-kmeans/predict-per-label (:data test-ds) model))
           labels (:labels test-ds)
           predictions (:label-indexes prediction-data)]
       {:accuracy (/ (dfn/sum (dfn/eq labels predictions))

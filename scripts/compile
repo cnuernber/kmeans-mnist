@@ -1,0 +1,5 @@
+#!/bin/bash
+
+rm -rf classes
+mkdir classes
+clojure -Ajdk16 -e "(compile 'kmeans-mnist.jl-kmeans)"

@@ -4,17 +4,22 @@
             [tech.v3.datatype :as dtype]
             [tech.v3.datatype.argops :as argops]
             [tech.v3.datatype.errors :as errors]
+            [tech.v3.datatype.nio-buffer :as nio-buffer]
             [tech.v3.datatype.functional :as dfn]
+            [tech.v3.datatype.native-buffer :as native-buffer]
             [tech.v3.tensor :as dtt]
             [tech.v3.parallel.for :as pfor]
             [tech.v3.datatype.reductions :as reductions]
             [tech.v3.libs.buffered-image :as bufimg]
+            [primitive-math :as pmath]
             [clojure.java.io :as io]
             [clojure.tools.logging :as log])
   (:import [java.util Random HashMap]
            [java.util.function BiFunction BiConsumer]
            [tech.v3.datatype ArrayHelpers IndexReduction
-            IndexReduction$IndexedBiFunction]))
+            IndexReduction$IndexedBiFunction]
+           [java.nio ByteBuffer DoubleBuffer]
+           [jdk.incubator.foreign NativeScope]))
 
 
 (set! *warn-on-reflection* true)
@@ -58,6 +63,23 @@
         sum#))))
 
 
+(defn jvm-convert-dataset!
+  [dataset dst-buf]
+  (dtype/copy! dataset dst-buf)
+  :ok)
+
+
+(defn jvm-by-hand-convert-dataset!
+  [dataset dst-buf]
+  (let [src-rdr (dtype/->reader dataset)
+        n-elems (.lsize src-rdr)
+        ^DoubleBuffer dbuf (nio-buffer/->nio-buffer dst-buf)]
+    (pfor/parallel-for
+     idx n-elems
+     (.put dbuf idx (.readDouble src-rdr idx)))
+    :ok))
+
+
 (defn jvm-next-centroid
   [dataset centroids idx distances scan-distances]
   (let [dataset (dtt/as-tensor dataset)
@@ -82,6 +104,183 @@
         (recur (unchecked-inc idx))))))
 
 
+(defn jvm-next-centroid-nio
+  [dataset centroids idx distances scan-distances]
+  (let [[nrows ncols] (dtype/shape dataset)
+        centroid-idx (long idx)
+        nrows (long nrows)
+        ncols (long ncols)]
+    (pfor/indexed-map-reduce
+     nrows
+     (fn centroid-nio-inner [^long start-row ^long nrows]
+       (let [^ByteBuffer dataset (nio-buffer/->nio-buffer dataset)
+             ^DoubleBuffer centroids (nio-buffer/->nio-buffer centroids)
+             ^DoubleBuffer distances (nio-buffer/->nio-buffer distances)]
+         (dotimes [rel-row-idx nrows]
+           (let [row-idx (pmath/+ start-row rel-row-idx)
+                 row-off (* row-idx ncols)
+                 cent-off (* centroid-idx ncols)
+                 sum (double
+                      (loop [col-idx 0
+                             sum 0.0]
+                        (if (< col-idx ncols)
+                          (let [diff (pmath/- (-> (.get dataset (pmath/+ col-idx row-off))
+                                                  (pmath/byte->ubyte)
+                                                  (double))
+                                              (.get centroids (pmath/+ col-idx cent-off)))]
+                            (recur (unchecked-inc col-idx)
+                                   (pmath/+ sum (pmath/* diff diff))))
+                          sum)))]
+             (when (< sum (.get distances row-idx))
+               (.put distances row-idx sum)))))))
+    (let [^DoubleBuffer distances (nio-buffer/->nio-buffer
+                                   (dtype/->buffer distances))
+          ^DoubleBuffer scan-distances (nio-buffer/->nio-buffer
+                                        (dtype/->buffer scan-distances))]
+      (.put scan-distances 0 (.get distances 0))
+      (loop [idx 1]
+        (when (< idx nrows)
+          (.put scan-distances idx
+                (+ (.get scan-distances (unchecked-dec idx))
+                   (.get distances idx)))
+          (recur (unchecked-inc idx)))))))
+
+
+(defn jvm-next-centroid-vec-instrinsics
+  [dataset centroids idx distances scan-distances]
+  (let [[nrows ncols] (dtype/shape dataset)
+        centroid-idx (long idx)
+        nrows (long nrows)
+        ncols (long ncols)]
+    (pfor/indexed-map-reduce
+     nrows
+     (fn [^long start-row ^long nrows]
+       (let [^ByteBuffer dataset (nio-buffer/->nio-buffer
+                                  (dtype/->buffer dataset))
+             ^DoubleBuffer centroids (nio-buffer/->nio-buffer
+                                      (dtype/->buffer centroids))
+             ^DoubleBuffer distances (nio-buffer/->nio-buffer
+                                      (dtype/->buffer distances))]
+         (dotimes [rel-row-idx nrows]
+           (let [row-idx (pmath/+ start-row rel-row-idx)
+                 row-off (* row-idx ncols)
+                 cent-off (* centroid-idx ncols)
+                 sum (double
+                      (loop [col-idx 0
+                             sum 0.0]
+                        (if (< col-idx ncols)
+                          (let [diff (pmath/- (-> (.get dataset (pmath/+ col-idx row-off))
+                                                  (pmath/byte->ubyte)
+                                                  (double))
+                                              (.get centroids (pmath/+ col-idx cent-off)))]
+                            (recur (unchecked-inc col-idx)
+                                   (pmath/+ sum (pmath/* diff diff))))
+                          sum)))]
+             (when (< sum (.get distances row-idx))
+               (.put distances row-idx sum)))))))
+    (let [^DoubleBuffer distances (nio-buffer/->nio-buffer
+                                   (dtype/->buffer distances))
+          ^DoubleBuffer scan-distances (nio-buffer/->nio-buffer
+                                        (dtype/->buffer scan-distances))]
+      (.put scan-distances 0 (.get distances 0))
+      (loop [idx 1]
+        (when (< idx nrows)
+          (.put scan-distances idx
+                (+ (.get scan-distances (unchecked-dec idx))
+                   (.get distances idx)))
+          (recur (unchecked-inc idx)))))))
+
+
+(defn jvm-next-centroid-reader
+  [dataset centroids idx distances scan-distances]
+  (let [[nrows ncols] (dtype/shape dataset)
+        centroid-idx (long idx)
+        nrows (long nrows)
+        ncols (long ncols)]
+    (pfor/indexed-map-reduce
+     nrows
+     (fn [^long start-row ^long nrows]
+       (let [dataset (dtype/->buffer dataset)
+             centroids (dtype/->buffer centroids)
+             distances (dtype/->buffer distances)]
+         (dotimes [rel-row-idx nrows]
+           (let [row-idx (pmath/+ start-row rel-row-idx)
+                 row-off (* row-idx ncols)
+                 cent-off (* centroid-idx ncols)
+                 sum (double
+                      (loop [col-idx 0
+                             sum 0.0]
+                        (if (< col-idx ncols)
+                          (let [diff (pmath/- (-> (.readByte dataset (pmath/+ col-idx row-off))
+                                                  (pmath/byte->ubyte)
+                                                  (double))
+                                              (.readDouble centroids (pmath/+ col-idx cent-off)))]
+                            (recur (unchecked-inc col-idx)
+                                   (pmath/+ sum (pmath/* diff diff))))
+                          sum)))]
+             (when (< sum (.readDouble distances row-idx))
+               (.writeDouble distances row-idx sum)))))))
+    (let [distances (dtype/->buffer distances)
+          scan-distances (dtype/->buffer scan-distances)]
+      (.writeDouble scan-distances 0 (.readDouble distances 0))
+      (loop [idx 1]
+        (when (< idx nrows)
+          (.writeDouble scan-distances idx
+                (+ (.readDouble scan-distances (unchecked-dec idx))
+                   (.readDouble distances idx)))
+          (recur (unchecked-inc idx)))))))
+
+
+(defn jvm-next-centroid-nobounds-unsafe
+  [dataset centroids idx distances scan-distances]
+  (let [[nrows ncols] (dtype/shape dataset)
+        centroid-idx (long idx)
+        nrows (long nrows)
+        ncols (long ncols)
+        unsafe (native-buffer/unsafe)]
+    (pfor/indexed-map-reduce
+     nrows
+     (fn [^long start-row ^long nrows]
+       (let [dataset-addr (.address (dtype/->native-buffer dataset))
+             centroids-addr (.address (dtype/->native-buffer centroids))
+             distances-addr (.address (dtype/->native-buffer distances))]
+         (dotimes [rel-row-idx nrows]
+           (let [row-idx (pmath/+ start-row rel-row-idx)
+                 row-off (* row-idx ncols)
+                 cent-off (* centroid-idx ncols)
+                 sum
+                 (double
+                  (loop [col-idx 0
+                         sum 0.0]
+                    (if (< col-idx ncols)
+                      (let [diff
+                            (pmath/- (-> (.getByte unsafe (pmath/+ dataset-addr
+                                                                   (pmath/+ col-idx row-off)))
+                                         (pmath/byte->ubyte)
+                                         (double))
+                                     (.getDouble unsafe (pmath/+ centroids-addr
+                                                                 (pmath/* 8 (pmath/+ col-idx cent-off)))))]
+                        (recur (unchecked-inc col-idx)
+                               (pmath/+ sum (pmath/* diff diff))))
+                      sum)))]
+             (when (< sum (.getDouble unsafe (pmath/+ distances-addr
+                                                      (pmath/* 8 row-idx))))
+               (.putDouble unsafe (pmath/+ distances-addr (* 8 row-idx)) sum)))))))
+    (let [distances-addr (.address (dtype/->native-buffer distances))
+          scan-distances-addr (.address (dtype/->native-buffer scan-distances))]
+      (.putDouble unsafe scan-distances-addr 0 (.getDouble unsafe distances-addr 0))
+      (loop [idx 1]
+        (when (< idx nrows)
+          (.putDouble unsafe (pmath/+ scan-distances-addr (* 8 idx))
+                      (pmath/+ (.getDouble unsafe
+                                           (pmath/+ scan-distances-addr
+                                                    (* 8 (unchecked-dec idx))))
+                               (.getDouble unsafe
+                                           (pmath/+ distances-addr
+                                                    (* 8 idx)))))
+          (recur (unchecked-inc idx)))))))
+
+
 (defn- seed->random
   ^Random [seed]
   (cond
@@ -95,7 +294,7 @@
     (errors/throwf "Unrecognized seed type: %s" seed)))
 
 
-(defn- choose-centroids++
+(defn choose-centroids++
   "Implementation of (sort of) kmeans++ center choosing algorithm.  As opposed to
   sorting the distances every centroid, we calculate a cumulative summation vector and
   do a binary search within this vector.  We take the next item after the potential
@@ -205,20 +404,28 @@
   ;; 285ms
   (def centroids (time (choose-centroids++
                         dataset 5 {:seed 5 :distance-fn jvm-next-centroid})))
-  ;;1163ms
+  ;; 900ms
+  (def centroids (time (choose-centroids++
+                        dataset 5 {:seed 5 :distance-fn jvm-next-centroid-nio})))
+  ;; 500ms
+  (def centroids (time (choose-centroids++
+                        dataset 5 {:seed 5 :distance-fn jvm-next-centroid-reader})))
+  ;; 800ms
+  (def centroids (time (choose-centroids++
+                        dataset 5 {:seed 5 :distance-fn jvm-next-centroid-nobounds-unsafe})))
+  ;; 518ms
+
 
   (def score (time (assign-centroids dataset centroids centroid-indexes)))
   ;; 103ms
   (def score (time (assign-centroids-imr dataset centroids centroid-indexes)))
-  ;; 103ms
-  (def score (time (jvm-assign-centroids dataset centroids centroid-indexes)))
-  ;; 775ms
+  ;; 57ms
 
   (def jvm-centroids
     (time (do
             (assign-centroids-imr dataset centroids centroid-indexes)
             (jvm-assign-centers-from-centroid-indexes dataset
-                                                      (count centroids)
+                                                      (first (dtype/shape centroids))
                                                       centroid-indexes))))
   ;; 200ms
 
